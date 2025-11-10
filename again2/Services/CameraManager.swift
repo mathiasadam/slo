@@ -2,6 +2,7 @@ import AVFoundation
 import SwiftUI
 import Combine
 import VideoToolbox
+import CoreLocation
 
 enum RecordingState: Equatable {
     case idle
@@ -19,6 +20,11 @@ class CameraManager: NSObject, ObservableObject {
     @Published var previewLayer: AVCaptureVideoPreviewLayer?
     var useRealtimeProcessing = true // Always real-time capture path
     @Published var currentCameraPosition: AVCaptureDevice.Position = .back
+
+    // Location manager for capturing location metadata
+    private let locationManager = CLLocationManager()
+    private var currentLocation: CLLocation?
+    private var currentLocationString: String?
     
     // Capture I/O
     private var videoDataOutput = AVCaptureVideoDataOutput()
@@ -34,6 +40,7 @@ class CameraManager: NSObject, ObservableObject {
     private let captureQueue = DispatchQueue(label: "com.slo.capture", qos: .userInteractive)
     private let sessionQueue = DispatchQueue(label: "com.slo.camera.session")
     private let recordingRenderQueue = DispatchQueue(label: "com.slo.recording.render", qos: .userInitiated)
+    private let fileManager = FileManager.default
     
     // Timing / counters
     private var recordingStartTime: CMTime?
@@ -46,6 +53,11 @@ class CameraManager: NSObject, ObservableObject {
     // Progress / UI
     @Published var recordingProgress: Double = 0.0
     @Published var processedVideoURL: URL?
+    @Published var storyClips: [StoryClip] = []
+
+    // Story persistence
+    private let storyClipsDirectory: URL
+    private let storyMetadataURL: URL
     
     // Output size calculated dynamically from camera format (3:4 portrait aspect)
     private var outputWidth = 1080
@@ -58,6 +70,18 @@ class CameraManager: NSObject, ObservableObject {
     private var pixelTransferSession: VTPixelTransferSession?
     private var superResolutionPoolAdaptor: CVPixelBufferPool?
 
+    struct StoryClip: Identifiable, Equatable, Codable {
+        let id: UUID
+        let filePath: String
+        let createdAt: Date
+        let duration: Double
+        let location: String?
+
+        var url: URL {
+            URL(fileURLWithPath: filePath)
+        }
+    }
+
     // Frame rate conversion for slow motion
     private let sourceFPS: Double = 120.0  // Capture frame rate
     private let targetFPS: Double = 30.0   // Output playback frame rate (4x slow motion)
@@ -68,8 +92,23 @@ class CameraManager: NSObject, ObservableObject {
     private var convertedFrameCount: Int64 = 0
     
     override init() {
+        let documentsDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        self.storyClipsDirectory = documentsDirectory.appendingPathComponent("StoryClips", isDirectory: true)
+        self.storyMetadataURL = storyClipsDirectory.appendingPathComponent("story_clips.json")
         super.init()
+        prepareStoryStorage()
+        loadStoryClips()
+        setupLocationManager()
         // Metal renderer will be initialized after camera setup with proper dimensions
+    }
+
+    // MARK: - Location Setup
+
+    private func setupLocationManager() {
+        locationManager.delegate = self
+        locationManager.desiredAccuracy = kCLLocationAccuracyBest
+        locationManager.requestWhenInUseAuthorization()
+        locationManager.startUpdatingLocation()
     }
     
     // MARK: - Metal Renderer Initialization
@@ -852,10 +891,10 @@ class CameraManager: NSObject, ObservableObject {
                 self.recordingState = .recording
             }
 
-            // Fallback: enforce a hard 1s max duration in case timestamp-based cutoff doesn't trigger
+            // Fallback: enforce a hard 0.5s max duration in case timestamp-based cutoff doesn't trigger
             recordingStopTimer?.cancel()
             let timer = DispatchSource.makeTimerSource(queue: recordingRenderQueue)
-            timer.schedule(deadline: .now() + 1.0)
+            timer.schedule(deadline: .now() + 0.5)
             timer.setEventHandler { [weak self] in
                 guard let self = self else { return }
                 if self.isRecording {
@@ -949,7 +988,102 @@ class CameraManager: NSObject, ObservableObject {
         recordingProgress = 0.0
         isFinishingRecording = false
     }
-    
+
+    // MARK: - Story Clips
+
+    func keepLatestClipAsStory() {
+        guard let url = processedVideoURL else { return }
+        appendStoryClip(from: url)
+        DispatchQueue.main.async {
+            self.processedVideoURL = nil
+        }
+    }
+
+    func deleteStoryClip(_ clip: StoryClip) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            if self.fileManager.fileExists(atPath: clip.url.path) {
+                try? self.fileManager.removeItem(at: clip.url)
+            }
+        }
+        DispatchQueue.main.async {
+            self.storyClips.removeAll { $0.id == clip.id }
+            self.persistStoryClips()
+        }
+    }
+
+    private func appendStoryClip(from url: URL) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let clipID = UUID()
+            let destinationURL = self.storyClipsDirectory.appendingPathComponent("\(clipID.uuidString).mov")
+            
+            do {
+                try self.fileManager.createDirectory(at: self.storyClipsDirectory, withIntermediateDirectories: true)
+                if self.fileManager.fileExists(atPath: destinationURL.path) {
+                    try self.fileManager.removeItem(at: destinationURL)
+                }
+                try self.fileManager.moveItem(at: url, to: destinationURL)
+            } catch {
+                print("❌ Failed to move story clip: \(error.localizedDescription)")
+                return
+            }
+            
+            let asset = AVAsset(url: destinationURL)
+            let durationSeconds = CMTimeGetSeconds(asset.duration)
+            let clip = StoryClip(
+                id: clipID,
+                filePath: destinationURL.path,
+                createdAt: Date(),
+                duration: durationSeconds.isFinite ? durationSeconds : 0,
+                location: self.currentLocationString
+            )
+            DispatchQueue.main.async {
+                self.storyClips.append(clip)
+                self.persistStoryClips()
+            }
+        }
+    }
+
+    private func prepareStoryStorage() {
+        do {
+            try fileManager.createDirectory(at: storyClipsDirectory, withIntermediateDirectories: true)
+        } catch {
+            print("⚠️ Failed to create story directory: \(error.localizedDescription)")
+        }
+    }
+
+    private func loadStoryClips() {
+        DispatchQueue.global(qos: .background).async { [weak self] in
+            guard let self = self else { return }
+            guard self.fileManager.fileExists(atPath: self.storyMetadataURL.path) else { return }
+            do {
+                let data = try Data(contentsOf: self.storyMetadataURL)
+                var clips = try JSONDecoder().decode([StoryClip].self, from: data)
+                clips = clips.filter { self.fileManager.fileExists(atPath: $0.url.path) }
+                DispatchQueue.main.async {
+                    self.storyClips = clips
+                }
+            } catch {
+                print("⚠️ Failed to load story clips: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func persistStoryClips() {
+        let clips = storyClips
+        DispatchQueue.global(qos: .background).async { [weak self] in
+            guard let self = self else { return }
+            do {
+                let data = try JSONEncoder().encode(clips)
+                try self.fileManager.createDirectory(at: self.storyClipsDirectory, withIntermediateDirectories: true)
+                try data.write(to: self.storyMetadataURL, options: .atomic)
+            } catch {
+                print("⚠️ Failed to save story clips: \(error.localizedDescription)")
+            }
+        }
+    }
+
     private func setRecordingState(_ newState: RecordingState) {
         DispatchQueue.main.async {
             self.recordingState = newState
@@ -962,6 +1096,39 @@ class CameraManager: NSObject, ObservableObject {
             self.recordingState = .failed(message)
         }
         cleanupRecordingState()
+    }
+}
+
+// MARK: - CLLocationManagerDelegate
+extension CameraManager: CLLocationManagerDelegate {
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let location = locations.last else { return }
+        currentLocation = location
+
+        // Reverse geocode to get location string
+        let geocoder = CLGeocoder()
+        geocoder.reverseGeocodeLocation(location) { [weak self] placemarks, error in
+            guard let self = self, let placemark = placemarks?.first, error == nil else { return }
+
+            // Build location string: "Neighborhood, City" or "City, Country"
+            var components: [String] = []
+
+            if let subLocality = placemark.subLocality {
+                components.append(subLocality)
+            } else if let locality = placemark.locality {
+                components.append(locality)
+            }
+
+            if let country = placemark.country {
+                components.append(country)
+            }
+
+            self.currentLocationString = components.isEmpty ? nil : components.joined(separator: ", ")
+        }
+    }
+
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        print("⚠️ Location error: \(error.localizedDescription)")
     }
 }
 
@@ -1023,19 +1190,19 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
             print("  📐 Frame rate conversion: \(Int(self.sourceFPS))fps → \(Int(self.targetFPS))fps")
         }
 
-        // Enforce max 1.0s duration based on source timestamps (real-time)
-        // This will result in ~4s of slow-motion playback
+        // Enforce max 0.5s duration based on source timestamps (real-time)
+        // This will result in ~2s of slow-motion playback
         if let start = self.recordingStartTime {
             let elapsed = CMTimeSubtract(sourceTimestamp, start)
             let elapsedSeconds = CMTimeGetSeconds(elapsed)
 
             // Update progress on main thread
-            let progress = min(elapsedSeconds / 1.0, 1.0)
+            let progress = min(elapsedSeconds / 0.5, 1.0)
             DispatchQueue.main.async {
                 self.recordingProgress = progress
             }
 
-            if elapsedSeconds >= 1.0 {
+            if elapsedSeconds >= 0.5 {
                 // Stop and drop further frames
                 DispatchQueue.main.async { self.stopRecording() }
                 return

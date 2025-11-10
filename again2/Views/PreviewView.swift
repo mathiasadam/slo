@@ -5,7 +5,7 @@ import AVFoundation
 struct PreviewView: View {
     let videoURL: URL
     let onRetake: () -> Void
-    let onSend: () -> Void
+    let onPost: () -> Void
 
     @State private var player: AVPlayer?
     @State private var isPlaying = false
@@ -40,7 +40,7 @@ struct PreviewView: View {
                 VStack {
                     Spacer()
                     
-                    HStack(spacing: 60) {
+                    HStack(spacing: 50) {
                         // Retake button
                         Button(action: {
                             player?.pause()
@@ -51,6 +51,21 @@ struct PreviewView: View {
                                     .font(.system(size: 30))
                                     .foregroundColor(.white)
                                 Text("Retake")
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundColor(.white)
+                            }
+                        }
+
+                        // Post button
+                        Button(action: {
+                            player?.pause()
+                            onPost()
+                        }) {
+                            VStack(spacing: 8) {
+                                Image(systemName: "paperplane.fill")
+                                    .font(.system(size: 30))
+                                    .foregroundColor(.white)
+                                Text("Post")
                                     .font(.system(size: 14, weight: .medium))
                                     .foregroundColor(.white)
                             }
